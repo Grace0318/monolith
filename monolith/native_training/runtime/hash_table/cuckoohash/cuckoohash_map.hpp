@@ -23,6 +23,7 @@
 #include <atomic>
 #include <bitset>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -136,7 +137,7 @@ class cuckoohash_map {
         maximum_hashpower_(NO_MAXIMUM_HASHPOWER),
         max_num_worker_threads_(0) {
     all_locks_.emplace_back(std::min(bucket_count(), size_type(kMaxNumLocks)),
-                            spinlock(), get_allocator());
+                            cuckoo_lock_type(), get_allocator());
   }
 
   /**
@@ -360,7 +361,7 @@ class cuckoohash_map {
       return 0;
     }
     counter_type s = 0;
-    for (spinlock &lock : get_current_locks()) {
+    for (cuckoo_lock_type &lock : get_current_locks()) {
       s += lock.elem_counter();
     }
     assert(s >= 0);
@@ -497,6 +498,47 @@ class cuckoohash_map {
       return false;
     }
   }
+
+  /**
+   * 使用共享锁的查找函数（仅在启用读写自旋锁时有效）
+   * 当 USE_RW_SPINLOCK=1 时，多个线程可以并发读取
+   * 当 USE_RW_SPINLOCK=0 时，退化为普通的独占锁
+   *
+   * @tparam K type of the key. This can be any type comparable with @c key_type
+   * @tparam F type of the functor. It should implement the method
+   * <tt>void operator()(const mapped_type&)</tt>.
+   * @param key the key to search for
+   * @param fn the functor to invoke if the element is found
+   * @return true if the key was found and functor invoked, false otherwise
+   */
+  template <typename K, typename F>
+  bool find_fn_shared(const K &key, F fn) const {
+    return find_fn_shared_impl(key, fn, std::integral_constant<bool, enable_shared_lock>{});
+  }
+
+ private:
+  // C++11兼容：使用模板特化替代 if constexpr
+  template <typename K, typename F>
+  bool find_fn_shared_impl(const K &key, F fn, std::true_type) const {
+    // 启用共享锁版本
+    const hash_value hv = hashed_key(key);
+    const auto b = snapshot_and_lock_two_shared(hv);
+    const table_position pos = cuckoo_find(key, hv.partial, b.i1, b.i2);
+    if (pos.status == ok) {
+      fn(buckets_[pos.index].mapped(pos.slot));
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  template <typename K, typename F>
+  bool find_fn_shared_impl(const K &key, F fn, std::false_type) const {
+    // 未启用共享锁，降级为独占锁
+    return find_fn(key, fn);
+  }
+
+ public:
 
   /**
    * Searches the table for @p key, and invokes @p fn on the value. @p fn is
@@ -775,7 +817,7 @@ class cuckoohash_map {
   void evict(std::function<bool(const Key &, const T &)> should_be_evict_fn) {
     locks_t &locks = get_current_locks();
     for (size_t l = 0; l < locks.size(); ++l) {
-      spinlock &lock = locks[l];
+      cuckoo_lock_type &lock = locks[l];
       if (!lock.is_migrated()) continue;
       lock.lock();
       const auto &lock_manager = LockManager(&lock);
@@ -803,7 +845,7 @@ class cuckoohash_map {
 
   void add_locks_from_other(const cuckoohash_map &other) {
     locks_t &other_locks = other.get_current_locks();
-    all_locks_.emplace_back(other_locks.size(), spinlock(), get_allocator());
+    all_locks_.emplace_back(other_locks.size(), cuckoo_lock_type(), get_allocator());
     std::copy(other_locks.begin(), other_locks.end(),
               get_current_locks().begin());
   }
@@ -935,6 +977,11 @@ class cuckoohash_map {
       return !lock_.test_and_set(std::memory_order_acq_rel);
     }
 
+    // 为兼容读写锁接口，spinlock的读写锁都是独占的
+    void lock_shared() noexcept { lock(); }
+    void unlock_shared() noexcept { unlock(); }
+    bool try_lock_shared() noexcept { return try_lock(); }
+
     counter_type &elem_counter() noexcept { return elem_counter_; }
     counter_type elem_counter() const noexcept { return elem_counter_; }
 
@@ -947,11 +994,188 @@ class cuckoohash_map {
     bool is_migrated_;
   };
 
+  // 高性能读写自旋锁实现
+  // 基于单个原子变量，支持多读者并发和独占写者
+  // 使用位掩码：bit 31=独占锁, bit 30=写者等待, bit 29-0=读者计数
+  class LIBCUCKOO_ALIGNAS(64) rw_spinlock {
+   private:
+    // bit 31: locked exclusive
+    // bit 30: writer pending  
+    // bit 29..0: reader lock count
+    static constexpr std::uint32_t locked_exclusive_mask = 1u << 31; // 0x8000'0000
+    static constexpr std::uint32_t writer_pending_mask = 1u << 30;   // 0x4000'0000
+    static constexpr std::uint32_t reader_lock_count_mask = writer_pending_mask - 1; // 0x3FFF'FFFF
+
+    std::atomic<std::uint32_t> state_ = {};
+    
+    // 自旋次数，在睡眠前的重试次数
+    static constexpr int spin_count = 4096; // 降低一些，避免过度消耗CPU
+
+   public:
+    rw_spinlock() : elem_counter_(0), is_migrated_(true) {}
+
+    rw_spinlock(const rw_spinlock &other) noexcept
+        : elem_counter_(other.elem_counter()),
+          is_migrated_(other.is_migrated()) {}
+
+    rw_spinlock &operator=(const rw_spinlock &other) noexcept {
+      elem_counter() = other.elem_counter();
+      is_migrated() = other.is_migrated();
+      return *this;
+    }
+
+    // 尝试获取共享锁（读锁）
+    bool try_lock_shared() noexcept {
+      std::uint32_t st = state_.load(std::memory_order_relaxed);
+      
+      if (st >= reader_lock_count_mask) {
+        // 独占锁已被持有，或写者等待，或读者数量已达最大
+        return false;
+      }
+      
+      std::uint32_t newst = st + 1;
+      return state_.compare_exchange_strong(st, newst, std::memory_order_acquire, std::memory_order_relaxed);
+    }
+
+    // 获取共享锁（读锁）
+    void lock_shared() noexcept {
+      for (;;) {
+        for (int k = 0; k < spin_count; ++k) {
+          std::uint32_t st = state_.load(std::memory_order_relaxed);
+          
+          if (st < reader_lock_count_mask) {
+            std::uint32_t newst = st + 1;
+            if (state_.compare_exchange_weak(st, newst, std::memory_order_acquire, std::memory_order_relaxed)) {
+              return;
+            }
+          }
+          
+          // 使用标准库替代 boost::core::sp_thread_pause()
+          std::this_thread::yield();
+        }
+        
+        // 使用标准库替代 boost::core::sp_thread_sleep()  
+        std::this_thread::sleep_for(std::chrono::microseconds(1));
+      }
+    }
+
+    // 释放共享锁（读锁）
+    void unlock_shared() noexcept {
+      state_.fetch_sub(1, std::memory_order_release);
+    }
+
+    // 尝试获取独占锁（写锁）
+    bool try_lock() noexcept {
+      std::uint32_t st = state_.load(std::memory_order_relaxed);
+      
+      if (st & locked_exclusive_mask) {
+        // 已被独占锁持有
+        return false;
+      }
+      
+      if (st & reader_lock_count_mask) {
+        // 有读者持有锁
+        return false;
+      }
+      
+      std::uint32_t newst = locked_exclusive_mask;
+      return state_.compare_exchange_strong(st, newst, std::memory_order_acquire, std::memory_order_relaxed);
+    }
+
+    // 获取独占锁（写锁）
+    void lock() noexcept {
+      for (;;) {
+        for (int k = 0; k < spin_count; ++k) {
+          std::uint32_t st = state_.load(std::memory_order_relaxed);
+          
+          if (st & locked_exclusive_mask) {
+            // 已被独占锁持有，继续自旋
+          } else if ((st & reader_lock_count_mask) == 0) {
+            // 没有独占锁，也没有读锁，尝试获取独占锁
+            std::uint32_t newst = locked_exclusive_mask;
+            if (state_.compare_exchange_weak(st, newst, std::memory_order_acquire, std::memory_order_relaxed)) {
+              return;
+            }
+          } else if (st & writer_pending_mask) {
+            // 写者等待位已设置，无需重复设置
+          } else {
+            // 有读者持有锁，设置写者等待位
+            std::uint32_t newst = st | writer_pending_mask;
+            state_.compare_exchange_weak(st, newst, std::memory_order_relaxed, std::memory_order_relaxed);
+          }
+          
+          std::this_thread::yield();
+        }
+        
+        // 在睡眠前清除写者等待位
+        {
+          std::uint32_t st = state_.load(std::memory_order_relaxed);
+          
+          for (;;) {
+            if (st & locked_exclusive_mask) {
+              // 已被独占锁持有，无需操作
+              break;
+            } else if ((st & reader_lock_count_mask) == 0) {
+              // 锁已释放，尝试获取
+              std::uint32_t newst = locked_exclusive_mask;
+              if (state_.compare_exchange_weak(st, newst, std::memory_order_acquire, std::memory_order_relaxed)) {
+                return;
+              }
+            } else if ((st & writer_pending_mask) == 0) {
+              // 写者等待位已清除，无需操作
+              break;
+            } else {
+              // 清除写者等待位
+              std::uint32_t newst = st & ~writer_pending_mask;
+              if (state_.compare_exchange_weak(st, newst, std::memory_order_relaxed, std::memory_order_relaxed)) {
+                break;
+              }
+            }
+          }
+        }
+        
+        std::this_thread::sleep_for(std::chrono::microseconds(1));
+      }
+    }
+
+    // 释放独占锁（写锁）
+    void unlock() noexcept {
+      state_.store(0, std::memory_order_release);
+    }
+
+    // 为了与spinlock接口兼容，添加元数据访问方法
+    counter_type &elem_counter() noexcept { return elem_counter_; }
+    counter_type elem_counter() const noexcept { return elem_counter_; }
+
+    bool &is_migrated() noexcept { return is_migrated_; }
+    bool is_migrated() const noexcept { return is_migrated_; }
+
+   private:
+    counter_type elem_counter_;
+    bool is_migrated_;
+  };
+
+  // 锁类型选择配置
+  // 1. 编译时定义: -DUSE_RW_SPINLOCK=1 使用读写自旋锁，-DUSE_RW_SPINLOCK=0 或不定义则使用普通自旋锁
+  // 2. 在包含此文件前定义: #define USE_RW_SPINLOCK 1
+#ifndef USE_RW_SPINLOCK
+#define USE_RW_SPINLOCK 0  // 默认使用普通spinlock
+#endif
+
+  // 根据宏定义选择锁类型
+#if USE_RW_SPINLOCK
+  using cuckoo_lock_type = rw_spinlock;
+  static constexpr bool enable_shared_lock = true;
+#else
+  using cuckoo_lock_type = spinlock;
+  static constexpr bool enable_shared_lock = false;
+#endif
+
   template <typename U>
   using rebind_alloc =
       typename std::allocator_traits<allocator_type>::template rebind_alloc<U>;
 
-  using locks_t = std::vector<spinlock, rebind_alloc<spinlock>>;
+  using locks_t = std::vector<cuckoo_lock_type, rebind_alloc<cuckoo_lock_type>>;
   using all_locks_t = std::list<locks_t, rebind_alloc<locks_t>>;
 
   // Classes for managing locked buckets. By storing and moving around sets of
@@ -959,10 +1183,15 @@ class cuckoohash_map {
   // properly.
 
   struct LockDeleter {
-    void operator()(spinlock *l) const { l->unlock(); }
+    void operator()(cuckoo_lock_type *l) const { l->unlock(); }
   };
 
-  using LockManager = std::unique_ptr<spinlock, LockDeleter>;
+  struct SharedLockDeleter {
+    void operator()(cuckoo_lock_type *l) const { l->unlock_shared(); }
+  };
+
+  using LockManager = std::unique_ptr<cuckoo_lock_type, LockDeleter>;
+  using SharedLockManager = std::unique_ptr<cuckoo_lock_type, SharedLockDeleter>;
 
   // Each of the locking methods can operate in two modes: locked_table_mode
   // and normal_mode. When we're in locked_table_mode, we assume the caller has
@@ -996,11 +1225,33 @@ class cuckoohash_map {
     LockManager first_manager_, second_manager_;
   };
 
+  // 共享锁版本的双桶管理类
+  class TwoSharedBuckets {
+   public:
+    TwoSharedBuckets() {}
+    TwoSharedBuckets(locks_t &locks, size_type i1_, size_type i2_)
+        : i1(i1_),
+          i2(i2_),
+          first_manager_(&locks[lock_ind(i1)]),
+          second_manager_((lock_ind(i1) != lock_ind(i2)) ? &locks[lock_ind(i2)]
+                                                         : nullptr) {}
+
+    void unlock() {
+      first_manager_.reset();
+      second_manager_.reset();
+    }
+
+    size_type i1, i2;
+
+   private:
+    SharedLockManager first_manager_, second_manager_;
+  };
+
   struct AllUnlocker {
     void operator()(cuckoohash_map *map) const {
       for (auto it = first_locked; it != map->all_locks_.end(); ++it) {
         locks_t &locks = *it;
-        for (spinlock &lock : locks) {
+        for (cuckoo_lock_type &lock : locks) {
           lock.unlock();
         }
       }
@@ -1019,7 +1270,7 @@ class cuckoohash_map {
   // check the hashpower to make sure it is the same as what it was before the
   // lock was taken. If it isn't unlock the bucket and throw a
   // hashpower_changed exception.
-  inline void check_hashpower(size_type hp, spinlock &lock) const {  // NOLINT
+  inline void check_hashpower(size_type hp, cuckoo_lock_type &lock) const {  // NOLINT
     if (hashpower() != hp) {
       lock.unlock();
       LIBCUCKOO_DBG("%s", "hashpower changed\n");
@@ -1046,7 +1297,7 @@ class cuckoohash_map {
   template <bool IS_LAZY>
   void rehash_lock(size_t l) const noexcept {
     locks_t &locks = get_current_locks();
-    spinlock &lock = locks[l];
+    cuckoo_lock_type &lock = locks[l];
     if (lock.is_migrated()) return;
 
     assert(is_data_nothrow_move_constructible());
@@ -1076,7 +1327,7 @@ class cuckoohash_map {
   LockManager lock_one(size_type hp, size_type i, normal_mode) const {
     locks_t &locks = get_current_locks();
     const size_type l = lock_ind(i);
-    spinlock &lock = locks[l];
+    cuckoo_lock_type &lock = locks[l];
     lock.lock();
     check_hashpower(hp, lock);
     rehash_lock<kIsLazy>(l);
@@ -1149,6 +1400,23 @@ class cuckoohash_map {
                                           : &locks[lock_ind(i3)]));
   }
 
+  // 共享锁版本的双桶锁定函数（仅在启用读写自旋锁时有效）
+  TwoSharedBuckets lock_two_shared(size_type hp, size_type i1, size_type i2) const {
+    size_type l1 = lock_ind(i1);
+    size_type l2 = lock_ind(i2);
+    if (l2 < l1) {
+      std::swap(l1, l2);
+    }
+    locks_t &locks = get_current_locks();
+    locks[l1].lock_shared();
+    check_hashpower(hp, locks[l1]);
+    if (l2 != l1) {
+      locks[l2].lock_shared();
+    }
+    // 读操作不需要rehash，只是读取数据
+    return TwoSharedBuckets(locks, i1, i2);
+  }
+
   // snapshot_and_lock_two loads locks the buckets associated with the given
   // hash value, making sure the hashpower doesn't change before the locks are
   // taken. Thus it ensures that the buckets and locks corresponding to the
@@ -1166,6 +1434,20 @@ class cuckoohash_map {
         return lock_two(hp, i1, i2, TABLE_MODE());
       } catch (hashpower_changed &) {
         // The hashpower changed while taking the locks. Try again.
+        continue;
+      }
+    }
+  }
+
+  // 共享锁版本的快照和锁定函数（仅在启用读写自旋锁时有效）
+  TwoSharedBuckets snapshot_and_lock_two_shared(const hash_value &hv) const {
+    while (true) {
+      const size_type hp = hashpower();
+      const size_type i1 = index_hash(hp, hv.hash);
+      const size_type i2 = alt_index(hp, hv.partial, i1);
+      try {
+        return lock_two_shared(hp, i1, i2);
+      } catch (hashpower_changed &) {
         continue;
       }
     }
@@ -1935,10 +2217,10 @@ class cuckoohash_map {
     }
 
     locks_t new_locks(std::min(size_type(kMaxNumLocks), new_bucket_count),
-                      spinlock(), get_allocator());
+                      cuckoo_lock_type(), get_allocator());
     assert(new_locks.size() > current_locks.size());
     std::copy(current_locks.begin(), current_locks.end(), new_locks.begin());
-    for (spinlock &lock : new_locks) {
+    for (cuckoo_lock_type &lock : new_locks) {
       lock.lock();
     }
     all_locks_.emplace_back(std::move(new_locks));
@@ -2080,7 +2362,7 @@ class cuckoohash_map {
     // This will also clear out any data in old_buckets and delete it, if we
     // haven't already.
     num_remaining_lazy_rehash_locks(0);
-    for (spinlock &lock : get_current_locks()) {
+    for (cuckoo_lock_type &lock : get_current_locks()) {
       lock.elem_counter() = 0;
       lock.is_migrated() = true;
     }
