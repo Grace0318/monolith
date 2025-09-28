@@ -1113,7 +1113,7 @@ class cuckoohash_map {
   // 1. 编译时定义: -DUSE_RW_SPINLOCK=1 使用读写自旋锁，-DUSE_RW_SPINLOCK=0 或不定义则使用普通自旋锁
   // 2. 在包含此文件前定义: #define USE_RW_SPINLOCK 1
 #ifndef USE_RW_SPINLOCK
-#define USE_RW_SPINLOCK 0  // 默认使用普通spinlock
+#define USE_RW_SPINLOCK 1  // 启用rw_spinlock进行测试
 #endif
 
   // 根据宏定义选择锁类型

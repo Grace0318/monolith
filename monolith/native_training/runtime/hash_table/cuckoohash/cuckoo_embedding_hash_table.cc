@@ -162,7 +162,7 @@ class CuckooEmbeddingHashTable : public EmbeddingHashTableInterface {
     auto find_fn = [&](EntryType& entry) {
       accessor_->Fill(entry_helper_.Get(entry), embedding);
     };
-    if (m_.find_fn(id, find_fn)) {
+    if (m_.find_fn_shared(id, find_fn)) {
       return 1;
     }
     // By default, returns all zero.
@@ -176,7 +176,7 @@ class CuckooEmbeddingHashTable : public EmbeddingHashTableInterface {
       entry[0] = std::move(accessor_->Save(entry_helper_.Get(raw_entry),
                                            raw_entry.GetTimestamp()));
     };
-    if (m_.find_fn(id, find_fn)) {
+    if (m_.find_fn_shared(id, find_fn)) {
       return;
     }
   }
