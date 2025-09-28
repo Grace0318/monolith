@@ -994,8 +994,6 @@ class cuckoohash_map {
     bool is_migrated_;
   };
 
-  // 高性能读写自旋锁实现
-  // 基于单个原子变量，支持多读者并发和独占写者
   // 使用位掩码：bit 31=独占锁, bit 30=写者等待, bit 29-0=读者计数
   class LIBCUCKOO_ALIGNAS(64) rw_spinlock {
    private:
@@ -1007,9 +1005,6 @@ class cuckoohash_map {
     static constexpr std::uint32_t reader_lock_count_mask = writer_pending_mask - 1; // 0x3FFF'FFFF
 
     std::atomic<std::uint32_t> state_ = {};
-    
-    // 自旋次数，在睡眠前的重试次数
-    static constexpr int spin_count = 4096; // 降低一些，避免过度消耗CPU
 
    public:
     rw_spinlock() : elem_counter_(0), is_migrated_(true) {}
@@ -1037,25 +1032,18 @@ class cuckoohash_map {
       return state_.compare_exchange_strong(st, newst, std::memory_order_acquire, std::memory_order_relaxed);
     }
 
-    // 获取共享锁（读锁）
+    // 获取共享锁（读锁）- 纯自旋版本
     void lock_shared() noexcept {
       for (;;) {
-        for (int k = 0; k < spin_count; ++k) {
-          std::uint32_t st = state_.load(std::memory_order_relaxed);
-          
-          if (st < reader_lock_count_mask) {
-            std::uint32_t newst = st + 1;
-            if (state_.compare_exchange_weak(st, newst, std::memory_order_acquire, std::memory_order_relaxed)) {
-              return;
-            }
-          }
-          
-          // 使用标准库替代 boost::core::sp_thread_pause()
-          std::this_thread::yield();
-        }
+        std::uint32_t st = state_.load(std::memory_order_relaxed);
         
-        // 使用标准库替代 boost::core::sp_thread_sleep()  
-        std::this_thread::sleep_for(std::chrono::microseconds(1));
+        if (st < reader_lock_count_mask) {
+          std::uint32_t newst = st + 1;
+          if (state_.compare_exchange_weak(st, newst, std::memory_order_acquire, std::memory_order_relaxed)) {
+            return;
+          }
+        }
+        // 纯自旋，无系统调用开销
       }
     }
 
@@ -1082,59 +1070,25 @@ class cuckoohash_map {
       return state_.compare_exchange_strong(st, newst, std::memory_order_acquire, std::memory_order_relaxed);
     }
 
-    // 获取独占锁（写锁）
+    // 获取独占锁（写锁）- 纯自旋版本
     void lock() noexcept {
       for (;;) {
-        for (int k = 0; k < spin_count; ++k) {
-          std::uint32_t st = state_.load(std::memory_order_relaxed);
-          
-          if (st & locked_exclusive_mask) {
-            // 已被独占锁持有，继续自旋
-          } else if ((st & reader_lock_count_mask) == 0) {
-            // 没有独占锁，也没有读锁，尝试获取独占锁
-            std::uint32_t newst = locked_exclusive_mask;
-            if (state_.compare_exchange_weak(st, newst, std::memory_order_acquire, std::memory_order_relaxed)) {
-              return;
-            }
-          } else if (st & writer_pending_mask) {
-            // 写者等待位已设置，无需重复设置
-          } else {
-            // 有读者持有锁，设置写者等待位
-            std::uint32_t newst = st | writer_pending_mask;
-            state_.compare_exchange_weak(st, newst, std::memory_order_relaxed, std::memory_order_relaxed);
-          }
-          
-          std::this_thread::yield();
-        }
+        std::uint32_t st = state_.load(std::memory_order_relaxed);
         
-        // 在睡眠前清除写者等待位
-        {
-          std::uint32_t st = state_.load(std::memory_order_relaxed);
-          
-          for (;;) {
-            if (st & locked_exclusive_mask) {
-              // 已被独占锁持有，无需操作
-              break;
-            } else if ((st & reader_lock_count_mask) == 0) {
-              // 锁已释放，尝试获取
-              std::uint32_t newst = locked_exclusive_mask;
-              if (state_.compare_exchange_weak(st, newst, std::memory_order_acquire, std::memory_order_relaxed)) {
-                return;
-              }
-            } else if ((st & writer_pending_mask) == 0) {
-              // 写者等待位已清除，无需操作
-              break;
-            } else {
-              // 清除写者等待位
-              std::uint32_t newst = st & ~writer_pending_mask;
-              if (state_.compare_exchange_weak(st, newst, std::memory_order_relaxed, std::memory_order_relaxed)) {
-                break;
-              }
-            }
+        if (st & locked_exclusive_mask) {
+          // 已被独占锁持有，继续自旋
+        } else if ((st & reader_lock_count_mask) == 0) {
+          // 没有独占锁，也没有读锁，尝试获取独占锁
+          std::uint32_t newst = locked_exclusive_mask;
+          if (state_.compare_exchange_weak(st, newst, std::memory_order_acquire, std::memory_order_relaxed)) {
+            return;
           }
+        } else if (!(st & writer_pending_mask)) {
+          // 有读者持有锁，设置写者等待位（阻止新读者）
+          std::uint32_t newst = st | writer_pending_mask;
+          state_.compare_exchange_weak(st, newst, std::memory_order_relaxed, std::memory_order_relaxed);
         }
-        
-        std::this_thread::sleep_for(std::chrono::microseconds(1));
+        // 纯自旋，无系统调用开销
       }
     }
 
@@ -1469,7 +1423,7 @@ class cuckoohash_map {
     auto current_locks = first_locked;
     while (current_locks != all_locks_.end()) {
       locks_t &locks = *current_locks;
-      for (spinlock &lock : locks) {
+      for (cuckoo_lock_type &lock : locks) {
         lock.lock();
       }
       ++current_locks;
@@ -2118,7 +2072,7 @@ class cuckoohash_map {
     } else {
       // Mark all current locks as un-migrated, so that we rehash the data
       // on-demand when the locks are taken.
-      for (spinlock &lock : current_locks) {
+      for (cuckoo_lock_type &lock : current_locks) {
         lock.is_migrated() = false;
       }
       num_remaining_lazy_rehash_locks(current_locks.size());
@@ -2128,7 +2082,7 @@ class cuckoohash_map {
     }
     return ok;
   }
-
+  
   void move_bucket(buckets_t &old_buckets, buckets_t &new_buckets,  // NOLINT
                    size_type old_bucket_ind) const noexcept {
     const size_t old_hp = old_buckets.hashpower();
