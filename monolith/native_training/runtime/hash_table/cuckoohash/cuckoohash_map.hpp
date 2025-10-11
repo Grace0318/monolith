@@ -1367,7 +1367,10 @@ class cuckoohash_map {
     if (l2 != l1) {
       locks[l2].lock_shared();
     }
-    // 读操作不需要rehash，只是读取数据
+    // 读操作同样需要rehash以保证数据一致性！
+    // 惰性迁移机制下，数据可能还在旧桶中，必须先迁移再读取
+    rehash_lock<kIsLazy>(l1);
+    rehash_lock<kIsLazy>(l2);
     return TwoSharedBuckets(locks, i1, i2);
   }
 
